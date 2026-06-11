@@ -509,7 +509,7 @@
             <span class="chart-card-title">Comparativo — Todos os Cômodos</span>
             <span class="chart-card-badge" id="comparativoBadge">Temperatura · 24h</span>
           </div>
-          <iframe class="chart-frame" id="frameComparativo" height="330" src="about:blank"></iframe>
+          <div id="frameComparativo" style="padding:16px;min-height:330px"></div>
         </div>
         <div class="charts-grid" id="chartsGrid"></div>
       </div>
@@ -821,6 +821,8 @@
 
   <!-- ── Plotly para gráficos inline ── -->
   <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+  <!-- ── Supabase JS (banco de dados) ── -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 
   <script>
   // ─────────────────────────────────────────────
@@ -833,6 +835,39 @@
     externa1: { nome: 'Externa 1', icone: '🌿',  cor: '#34d399' },
     externa2: { nome: 'Externa 2', icone: '🌤',  cor: '#fbbf24' },
   };
+
+  // ─────────────────────────────────────────────
+  // SUPABASE (banco de dados)
+  // ─────────────────────────────────────────────
+  const SUPABASE_URL = 'https://ozxwhdzmjqbhvqzjxklw.supabase.co';
+  const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im96eHdoZHptanFiaHZxemp4a2x3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODExMzU5NzQsImV4cCI6MjA5NjcxMTk3NH0.U4CP9iTSJa2NEDRq7lDJQYonSH5NqmCJCD5G_SSsoUQ';
+  const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+  function isoHorasAtras(horas) {
+    return new Date(Date.now() - horas * 3600 * 1000).toISOString();
+  }
+  function inicioDoDiaISO() {
+    const d = new Date(); d.setHours(0, 0, 0, 0);
+    return d.toISOString();
+  }
+  // limites usados para nível de alerta dos sensores de gás (ADC bruto)
+  const GAS_THRESHOLDS = {
+    mq09: { ok: 200, warn: 500 },
+    mq02: { ok: 300, warn: 700 },
+    mq05: { ok: 300, warn: 700 },
+  };
+  const GAS_INFO = {
+    mq09: { nome: 'Quarto · MQ-09',   gas: 'CO / Gás Combustível', cor: '#a78bfa' },
+    mq02: { nome: 'Cozinha · MQ-02',  gas: 'Fumaça',               cor: '#fb923c' },
+    mq05: { nome: 'Cozinha · MQ-05',  gas: 'GLP / Butano',         cor: '#fbbf24' },
+  };
+  function calcNivel(sensor, valor) {
+    if (valor == null) return 'offline';
+    const t = GAS_THRESHOLDS[sensor];
+    if (valor >= t.warn) return 'perigo';
+    if (valor >= t.ok) return 'atencao';
+    return 'normal';
+  }
 
   const LAYOUT_BASE = {
     template: 'plotly_dark',
@@ -919,8 +954,18 @@
 
   async function carregarClima() {
     try {
-      const [atualRes] = await Promise.all([fetch('/api/clima/atual')]);
-      const atual = await atualRes.json();
+      const chaves = Object.keys(COMODOS);
+      const resultados = await Promise.all(chaves.map(c =>
+        sb.from('leituras_clima').select('temp,umidade,pressao,data_hora')
+          .eq('comodo', c).order('data_hora', { ascending: false }).limit(1)
+      ));
+      const atual = {};
+      chaves.forEach((c, i) => {
+        const row = resultados[i].data?.[0];
+        atual[c] = row
+          ? { temp: row.temp, umidade: row.umidade, pressao: row.pressao, data_hora: row.data_hora }
+          : { temp: null, umidade: null, pressao: null, data_hora: null };
+      });
       renderRooms(atual);
       atualizarStatusBarClima(atual);
       carregarGraficosClima();
@@ -971,23 +1016,69 @@
     carregarGraficosClima();
   }
 
-  function carregarGraficosClima() {
+  async function carregarGraficosClima() {
     const horas = getHoras();
     const labels = { temp: 'Temperatura', umidade: 'Umidade' };
-    $('frameComparativo').src = `/api/grafico/clima?tipo=comparativo&metrica=${metricaClima}&horas=${horas}`;
     $('comparativoBadge').textContent = `${labels[metricaClima]} · ${horas}h`;
-    const grid = $('chartsGrid');
     const chaves = Object.keys(COMODOS);
+
+    // Monta os cards dos gráficos individuais (vazios por enquanto)
+    const grid = $('chartsGrid');
     grid.innerHTML = chaves.map((chave, i) => {
-      const cfg = COMODOS[chave]; const url = `/api/grafico/clima?tipo=individual&comodo=${chave}&metrica=${metricaClima}&horas=${horas}`;
+      const cfg = COMODOS[chave];
       return `<div class="chart-card" style="animation:fadeUp .4s ease both;animation-delay:${i*70}ms">
         <div class="chart-card-header">
           <span class="chart-card-title">${cfg.icone} ${cfg.nome}</span>
           <span class="chart-card-badge" style="color:${cfg.cor}">${metricaClima==='temp'?'°C':'%RH'}</span>
         </div>
-        <iframe class="chart-frame" src="${url}" height="270"></iframe>
+        <div id="chart-${chave}" style="padding:0 16px 16px;min-height:270px"></div>
       </div>`;
     }).join('');
+
+    const desde = isoHorasAtras(horas);
+    const resultados = await Promise.all(chaves.map(c =>
+      sb.from('leituras_clima').select('data_hora,' + metricaClima)
+        .eq('comodo', c).gte('data_hora', desde).order('data_hora', { ascending: true })
+    ));
+
+    const comparativoTraces = [];
+    chaves.forEach((chave, i) => {
+      const cfg = COMODOS[chave];
+      const linhas = resultados[i].data || [];
+      const x = linhas.map(r => r.data_hora);
+      const y = linhas.map(r => r[metricaClima]);
+      const rgb = hexRgb(cfg.cor);
+
+      comparativoTraces.push({
+        x, y, type: 'scatter', mode: 'lines', name: cfg.nome,
+        line: { color: cfg.cor, width: 2, shape: 'spline' },
+        hovertemplate: '%{y:.1f}<extra></extra>',
+      });
+
+      const elId = 'chart-' + chave;
+      if (x.length === 0) {
+        $(elId).innerHTML = '<div class="empty"><div class="empty-icon">📭</div>Sem dados históricos</div>';
+        return;
+      }
+      Plotly.newPlot(elId, [{
+        x, y, type: 'scatter', mode: 'lines', name: cfg.nome,
+        line: { color: cfg.cor, width: 2.5, shape: 'spline' },
+        fill: 'tozeroy', fillcolor: `rgba(${rgb},0.08)`,
+        hovertemplate: '%{y:.1f}<extra></extra>',
+      }], {
+        ...LAYOUT_BASE, height: 230, showlegend: false,
+        yaxis: { ...LAYOUT_BASE.yaxis, title: metricaClima === 'temp' ? '°C' : '%RH' },
+      }, { responsive: true, displayModeBar: false });
+    });
+
+    if (comparativoTraces.every(t => t.x.length === 0)) {
+      $('frameComparativo').innerHTML = '<div class="empty"><div class="empty-icon">📭</div>Sem dados históricos</div>';
+    } else {
+      Plotly.newPlot('frameComparativo', comparativoTraces, {
+        ...LAYOUT_BASE, height: 330, showlegend: true,
+        yaxis: { ...LAYOUT_BASE.yaxis, title: metricaClima === 'temp' ? '°C' : '%RH' },
+      }, { responsive: true, displayModeBar: false });
+    }
   }
 
   function focarComodo(chave) {
@@ -1067,41 +1158,61 @@
     Plotly.newPlot(containerId, [trace], layout, { responsive: true, displayModeBar: false });
   }
 
+  function statsDe(valores) {
+    if (!valores.length) return null;
+    const min = Math.min(...valores), max = Math.max(...valores);
+    const mean = Math.round(valores.reduce((a,b) => a+b, 0) / valores.length);
+    return { min, max, mean };
+  }
+
+  async function carregarSensorGas(sensor) {
+    const horas = getHoras();
+    const desde = isoHorasAtras(horas);
+    const [ultimoRes, histRes] = await Promise.all([
+      sb.from('leituras_gas').select('valor,data_hora').eq('sensor', sensor).order('data_hora', { ascending: false }).limit(1),
+      sb.from('leituras_gas').select('valor,data_hora').eq('sensor', sensor).gte('data_hora', desde).order('data_hora', { ascending: true }),
+    ]);
+    const ultimoRow = ultimoRes.data?.[0];
+    const linhas = histRes.data || [];
+    const valores = linhas.map(r => r.valor);
+    const info = GAS_INFO[sensor];
+    return {
+      nome: info.nome, gas: info.gas, cor: info.cor,
+      ultimo: ultimoRow ? ultimoRow.valor : null,
+      data_hora: ultimoRow ? ultimoRow.data_hora : null,
+      nivel: calcNivel(sensor, ultimoRow?.valor ?? null),
+      thresholds: GAS_THRESHOLDS[sensor],
+      stats: statsDe(valores),
+      historico: { timestamps: linhas.map(r => r.data_hora), valores },
+    };
+  }
+
   async function carregarGas() {
     try {
-      const [quartoRes, cozinhaRes] = await Promise.all([
-        fetch('/api/gas/comodo?comodo=quarto&horas=' + getHoras()),
-        fetch('/api/gas/comodo?comodo=cozinha&horas=' + getHoras()),
+      const [mq09, mq02, mq05] = await Promise.all([
+        carregarSensorGas('mq09'),
+        carregarSensorGas('mq02'),
+        carregarSensorGas('mq05'),
       ]);
-      const quarto  = await quartoRes.json();
-      const cozinha = await cozinhaRes.json();
 
       // Quarto
-      const qSensores = quarto.sensores || {};
-      $('gasQuartoGrid').innerHTML = Object.entries(qSensores).map(([k,s]) => renderGasCard(k,s)).join('') ||
-        '<div class="gas-card"><div class="empty"><div class="empty-icon">📭</div>Coluna mq09 não disponível ainda</div></div>';
-
-      const mq09 = qSensores['mq09'];
-      if (mq09?.historico?.timestamps?.length) {
+      $('gasQuartoGrid').innerHTML = renderGasCard('mq09', mq09);
+      if (mq09.historico.timestamps.length) {
         renderGasChart('gasQuartoChart', mq09.historico.timestamps, mq09.historico.valores, mq09.cor, mq09.nome);
       } else {
         $('gasQuartoChart').innerHTML = '<div class="empty"><div class="empty-icon">📭</div>Aguardando dados do MQ-09 do quarto</div>';
       }
 
       // Cozinha
-      const cSensores = cozinha.sensores || {};
-      $('gasCozinhaGrid').innerHTML = Object.entries(cSensores).map(([k,s]) => renderGasCard(k,s)).join('') ||
-        '<div class="gas-card"><div class="empty"><div class="empty-icon">📭</div>Colunas mq02/mq05 não disponíveis ainda</div></div>';
+      $('gasCozinhaGrid').innerHTML = renderGasCard('mq02', mq02) + renderGasCard('mq05', mq05);
 
-      const mq02 = cSensores['mq02'];
-      const mq05 = cSensores['mq05'];
-      if (mq02?.historico?.timestamps?.length) renderGasChart('gasCozinhaMQ02Chart', mq02.historico.timestamps, mq02.historico.valores, mq02.cor, mq02.nome);
+      if (mq02.historico.timestamps.length) renderGasChart('gasCozinhaMQ02Chart', mq02.historico.timestamps, mq02.historico.valores, mq02.cor, mq02.nome);
       else $('gasCozinhaMQ02Chart').innerHTML = '<div class="empty"><div class="empty-icon">📭</div>Aguardando dados MQ-02</div>';
-      if (mq05?.historico?.timestamps?.length) renderGasChart('gasCozinhaMQ05Chart', mq05.historico.timestamps, mq05.historico.valores, mq05.cor, mq05.nome);
+      if (mq05.historico.timestamps.length) renderGasChart('gasCozinhaMQ05Chart', mq05.historico.timestamps, mq05.historico.valores, mq05.cor, mq05.nome);
       else $('gasCozinhaMQ05Chart').innerHTML = '<div class="empty"><div class="empty-icon">📭</div>Aguardando dados MQ-05</div>';
 
       // Alerta visual cozinha se houver perigo
-      const hayPeligro = Object.values(cSensores).some(s => s.nivel === 'perigo');
+      const hayPeligro = [mq02, mq05].some(s => s.nivel === 'perigo');
       if (hayPeligro) {
         $('panel-gas').style.animation = 'pulseRed 2s ease-in-out 3';
         document.querySelector('[data-tab="gas"]').style.color = 'var(--red)';
@@ -1118,16 +1229,41 @@
 
   async function carregarIrrigacao() {
     try {
-      const [statusRes, histRes, soloRes] = await Promise.all([
-        fetch('/api/irrigacao/status'),
-        fetch('/api/irrigacao/historico?dias=7'),
-        fetch('/api/irrigacao/historico_solo?horas=24'),
+      const [leituraRes, ultimoCicloRes, hojeRes, histRes, soloRes] = await Promise.all([
+        sb.from('irrigacao_leituras').select('*').order('data_hora', { ascending: false }).limit(1),
+        sb.from('irrigacao_historico').select('*').order('inicio', { ascending: false }).limit(1),
+        sb.from('irrigacao_historico').select('duracao_seg,cancelado').gte('inicio', inicioDoDiaISO()),
+        sb.from('irrigacao_historico').select('*').gte('inicio', isoHorasAtras(24 * 7)).order('inicio', { ascending: false }),
+        sb.from('irrigacao_leituras').select('data_hora,umidade_solo,rele_ligado').gte('data_hora', isoHorasAtras(24)).order('data_hora', { ascending: true }),
       ]);
-      const status = await statusRes.json();
-      const hist   = await histRes.json();
-      const solo   = await soloRes.json();
 
-      if (status.erro) { console.warn('Irrigação:', status.erro); return; }
+      const leitura = leituraRes.data?.[0] || {};
+      const ultimoCiclo = ultimoCicloRes.data?.[0] || null;
+      const regasHoje = (hojeRes.data || []).filter(r => !r.cancelado);
+      const tempoRegadoHojeSeg = regasHoje.reduce((acc, r) => acc + (r.duracao_seg || 0), 0);
+
+      const chuva = leitura.chuva ?? null;
+      const soloV = leitura.umidade_solo ?? null;
+      let decisao;
+      if (chuva) decisao = { vai_regar: false, motivo: 'Chuva detectada — rega cancelada' };
+      else if (soloV != null && soloV < 35) decisao = { vai_regar: true, motivo: 'Solo seco — irrigação recomendada' };
+      else decisao = { vai_regar: false, motivo: 'Solo com umidade adequada — aguardando próximo ciclo' };
+
+      const status = {
+        rele_ligado: leitura.rele_ligado || false,
+        ultimo_ciclo: ultimoCiclo,
+        regou_hoje: regasHoje.length > 0,
+        regas_hoje: regasHoje.length,
+        tempo_regado_hoje_seg: tempoRegadoHojeSeg,
+        leitura_atual: { chuva, temp: leitura.temp ?? null, umidade_solo: soloV },
+        decisao,
+      };
+      const hist = histRes.data || [];
+      const solo = {
+        timestamps: (soloRes.data || []).map(r => r.data_hora),
+        umidade_solo: (soloRes.data || []).map(r => r.umidade_solo),
+        rele_ligado: (soloRes.data || []).map(r => r.rele_ligado),
+      };
 
       // Relé indicator
       const rele = status.rele_ligado;
@@ -1143,14 +1279,15 @@
       $('reguHoje').style.color = status.regou_hoje ? 'var(--green)' : 'var(--muted)';
       $('tempoRegado').textContent = segsParaHMS(status.tempo_regado_hoje_seg);
 
-      const chuva = status.leitura_atual?.chuva;
-      $('chuvaStatus').textContent = chuva === true ? '🌧️ Chuva detectada' : chuva === false ? '☀️ Sem chuva' : '—';
-      $('chuvaStatus').style.color = chuva ? 'var(--cyan)' : 'var(--yellow)';
+      const chuvaAtual = status.leitura_atual?.chuva;
+      $('chuvaStatus').textContent = chuvaAtual === true ? '🌧️ Chuva detectada' : chuvaAtual === false ? '☀️ Sem chuva' : '—';
+      $('chuvaStatus').style.color = chuvaAtual ? 'var(--cyan)' : 'var(--yellow)';
       $('irrigTemp').textContent = status.leitura_atual?.temp != null ? status.leitura_atual.temp + '°C' : '—';
 
       // Solo bar
-      const soloV = status.leitura_atual?.umidade_solo;
-      if (soloV != null) {
+      const soloAtual = status.leitura_atual?.umidade_solo;
+      if (soloAtual != null) {
+        const soloV = soloAtual;
         $('soloVal').textContent = soloV.toFixed(1) + '%';
         $('soloBar').style.width = soloV + '%';
         const cor = soloV < 35 ? '#f87171' : soloV < 80 ? '#34d399' : '#38bdf8';
@@ -1161,7 +1298,7 @@
       // Decisão
       const dec = status.decisao;
       const decBox = $('decisaoBox');
-      if (chuva) {
+      if (chuvaAtual) {
         decBox.className = 'decisao-box nao'; decBox.innerHTML = '<span>🌧️</span><span>' + (dec.motivo || 'Chuva — rega cancelada') + '</span>';
       } else if (dec.vai_regar) {
         decBox.className = 'decisao-box vai'; decBox.innerHTML = '<span>💧</span><span>' + (dec.motivo || 'Sistema vai regar') + '</span>';
@@ -1213,14 +1350,13 @@
     $('btnRegar').disabled = true;
     $('btnRegar').innerHTML = '⏳ Enviando...';
     try {
-      const res = await fetch('/api/irrigacao/comando', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ comando: 'ligar', origem: 'web' }) });
-      const data = await res.json();
-      if (data.ok) {
+      const { error } = await sb.from('irrigacao_comandos').insert({ comando: 'ligar', origem: 'web' });
+      if (!error) {
         btnBloqueadoAte = Date.now() + 30 * 60 * 1000;
         $('btnRegar').innerHTML = '✅ Comando enviado!';
         setTimeout(() => carregarIrrigacao(), 2000);
       } else {
-        $('btnRegar').innerHTML = '❌ Erro: ' + (data.erro || 'desconhecido');
+        $('btnRegar').innerHTML = '❌ Erro: ' + error.message;
         setTimeout(() => carregarIrrigacao(), 3000);
       }
     } catch(e) {
@@ -1235,15 +1371,44 @@
   async function carregarSala() {
     try {
       const horas = getHoras();
-      const [luzRes, movRes] = await Promise.all([
-        fetch('/api/sala/luminosidade?horas=' + horas),
-        fetch('/api/sala/movimento?horas=' + horas),
+      const LUZ_THRESHOLD = 500;
+      const [ultimaLuzRes, histLuzRes, hojeLuzRes, movHojeRes, movPeriodoRes] = await Promise.all([
+        sb.from('sala_luminosidade').select('valor,data_hora').order('data_hora', { ascending: false }).limit(1),
+        sb.from('sala_luminosidade').select('data_hora,valor').gte('data_hora', isoHorasAtras(horas)).order('data_hora', { ascending: true }),
+        sb.from('sala_luminosidade').select('valor').gte('data_hora', inicioDoDiaISO()),
+        sb.from('sala_movimento').select('data_hora').gte('data_hora', inicioDoDiaISO()).order('data_hora', { ascending: false }),
+        sb.from('sala_movimento').select('data_hora').gte('data_hora', isoHorasAtras(horas)).order('data_hora', { ascending: true }),
       ]);
-      const luz = await luzRes.json();
-      const mov = await movRes.json();
 
-      if (luz.erro) console.warn('Luz:', luz.erro);
-      if (mov.erro) console.warn('Mov:', mov.erro);
+      const ultimaLuz = ultimaLuzRes.data?.[0] || {};
+      const acesasHoje = (hojeLuzRes.data || []).filter(r => r.valor >= LUZ_THRESHOLD).length;
+      const luz = {
+        estado_atual: (ultimaLuz.valor ?? 0) >= LUZ_THRESHOLD ? 'acesa' : 'apagada',
+        valor_atual: ultimaLuz.valor ?? null,
+        data_hora: ultimaLuz.data_hora || null,
+        threshold: LUZ_THRESHOLD,
+        // estimativa: cada leitura representa ~1 minuto acesa
+        minutos_aceso_hoje: acesasHoje,
+        historico: {
+          timestamps: (histLuzRes.data || []).map(r => r.data_hora),
+          valores: (histLuzRes.data || []).map(r => r.valor),
+        },
+      };
+
+      const eventosHoje = (movHojeRes.data || []).map(r => r.data_hora);
+      const eventosPeriodo = (movPeriodoRes.data || []).map(r => r.data_hora);
+      const ultima = eventosHoje[0];
+      let haQuanto = null;
+      if (ultima) {
+        const diffMin = Math.floor((Date.now() - new Date(ultima)) / 60000);
+        haQuanto = diffMin < 1 ? 'agora' : diffMin < 60 ? diffMin + 'min atrás' : Math.floor(diffMin / 60) + 'h atrás';
+      }
+      const mov = {
+        total_hoje: eventosHoje.length,
+        ultima_deteccao_fmt: ultima ? fmtHora(ultima) : null,
+        ha_quanto_tempo: haQuanto,
+        eventos: eventosPeriodo,
+      };
 
       // Luminosidade
       const acesa = luz.estado_atual === 'acesa';
@@ -1337,11 +1502,18 @@
   async function carregarEnergia() {
     try {
       const horas = getHoras();
-      const res = await fetch('/api/servidor/energia?horas=' + horas);
-      const data = await res.json();
-      
-      if (data.erro) { console.warn('Energia:', data.erro); return; }
-      
+      const [ultimaRes, histRes] = await Promise.all([
+        sb.from('energia_leituras').select('potencia_w,consumo_kwh,data_hora').order('data_hora', { ascending: false }).limit(1),
+        sb.from('energia_leituras').select('data_hora,potencia_w').gte('data_hora', isoHorasAtras(horas)).order('data_hora', { ascending: true }),
+      ]);
+      const data = {
+        atual: ultimaRes.data?.[0] || {},
+        historico: {
+          timestamps: (histRes.data || []).map(r => r.data_hora),
+          potencia_w: (histRes.data || []).map(r => r.potencia_w),
+        },
+      };
+
       const atual = data.atual || {};
       $('energiaPotencia').textContent = atual.potencia_w != null ? atual.potencia_w + ' W' : '—';
       $('energiaConsumo').textContent = atual.consumo_kwh != null ? atual.consumo_kwh + ' kWh' : '—';
@@ -1371,11 +1543,20 @@
   // ─────────────────────────────────────────────
   // ABA TABELA
   // ─────────────────────────────────────────────
+  // Colunas exibidas por cômodo: externa1 vem da estação de irrigação, os demais de leituras_clima
+  const TABELA_CONFIG = {
+    quarto:   { tabela: 'leituras_clima',     colunas: ['id','data_hora','temp','umidade','pressao'] },
+    sala:     { tabela: 'leituras_clima',     colunas: ['id','data_hora','temp','umidade','pressao'] },
+    cozinha:  { tabela: 'leituras_clima',     colunas: ['id','data_hora','temp','umidade','pressao'] },
+    externa2: { tabela: 'leituras_clima',     colunas: ['id','data_hora','temp','umidade','pressao'] },
+    externa1: { tabela: 'irrigacao_leituras', colunas: ['id','data_hora','temp','umidade_solo','chuva','rele_ligado'] },
+  };
+
   async function carregarTabela(pagina) {
     tabelaPagAtual = pagina;
     const comodo    = $('tabelaComodo').value;
-    const horas     = $('tabelaHoras').value;
-    const porPagina = $('tabelaPorPag').value;
+    const horas     = Number($('tabelaHoras').value);
+    const porPagina = Number($('tabelaPorPag').value);
 
     $('dataTableHead').innerHTML = '<tr><th colspan="10" style="text-align:center">Carregando...</th></tr>';
     $('dataTableBody').innerHTML = '';
@@ -1383,14 +1564,25 @@
     $('tabelaMeta').textContent  = '...';
 
     try {
-      const res  = await fetch(`/api/tabela?comodo=${comodo}&horas=${horas}&pagina=${pagina}&por_pagina=${porPagina}`);
-      const data = await res.json();
-      tabelaDados = data;
+      const cfg = TABELA_CONFIG[comodo];
+      const desde = isoHorasAtras(horas);
+      const from = (pagina - 1) * porPagina;
+      const to = from + porPagina - 1;
 
-      if (data.erro) {
-        $('dataTableHead').innerHTML = `<tr><th colspan="10" style="color:var(--red)">Erro: ${data.erro}</th></tr>`;
-        return;
-      }
+      let query = sb.from(cfg.tabela).select(cfg.tabela === 'leituras_clima' ? cfg.colunas.join(',') + ',comodo' : cfg.colunas.join(','), { count: 'exact' })
+        .gte('data_hora', desde).order('data_hora', { ascending: false }).range(from, to);
+      if (cfg.tabela === 'leituras_clima') query = query.eq('comodo', comodo);
+
+      const { data: linhas, count, error } = await query;
+      if (error) throw error;
+
+      const data = {
+        comodo, horas, total: count || 0,
+        paginas: Math.max(1, Math.ceil((count || 0) / porPagina)),
+        colunas: cfg.colunas,
+        linhas: (linhas || []).map(r => ({ ...r, data_hora: fmtDtShort(r.data_hora) })),
+      };
+      tabelaDados = data;
 
       // Cabeçalho
       $('dataTableHead').innerHTML = `<tr>${data.colunas.map(c => `<th>${c} <span style="opacity:.4">↕</span></th>`).join('')}</tr>`;
